@@ -1,0 +1,8 @@
+# Credentials and local state must never enter source control.
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite
+__pycache__/
+*.py[cod]
