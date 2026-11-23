@@ -25,30 +25,17 @@ The adapter uses the Kraken REST API over HTTPS. Public ticker, OHLC, asset-pair
 
 3. Use a least-privilege environment and rotate/revoke credentials if exposed. Keep `.env` files out of version control; the client reads environment variables only when a private query is invoked.
 
-Example (module import from this flat repository):
+## Tests and CI
 
-```python
-from kraken import KrakenClient
-
-client = KrakenClient()
-print(client.public_health())
-# Private calls need the read-only credentials above:
-# balances = client.balances()
-# orders = client.open_orders()
-# history = client.trade_history()
-```
-
-The adapter logs endpoint names only, uses bounded retries for Kraken rate-limit responses, and does not retry ambiguous network failures for private requests. Health-check output does not include balance amounts. Treat account data as sensitive regardless.
-
-## Tests
-
-From the repository root:
+Run locally with:
 
 ```bash
-python -m unittest -v test_manager test_kraken
+python -m unittest discover -v
 ```
 
-Kraken adapter tests use mocked responses and make no network calls. Tests were not executed as part of this repository edit because no code-execution/test runner is available through the provided GitHub tools.
+GitHub Actions runs this command on pushes and pull requests using Python 3.11, 3.12 and 3.13. The adapter tests use mocked responses and make no Kraken network calls.
+
+The private retry path constructs and signs a new request on every attempt with a fresh strictly increasing nonce. Rate-limited responses are retried with bounded backoff; authentication failures are surfaced without retry. Ambiguous network failures are not retried.
 
 ## Existing paper CLI
 

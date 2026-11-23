@@ -19,12 +19,9 @@ import urllib.parse
 import urllib.request
 from typing import Callable, Mapping
 
-
 _LOG = logging.getLogger(__name__)
 _BASE_URL = "https://api.kraken.com"
-_PUBLIC_ENDPOINTS = frozenset({
-    "Ticker", "OHLC", "AssetPairs", "Depth", "SystemStatus",
-})
+_PUBLIC_ENDPOINTS = frozenset({"Ticker", "OHLC", "AssetPairs", "Depth", "SystemStatus"})
 _PRIVATE_ENDPOINTS = frozenset({"Balance", "OpenOrders", "TradesHistory"})
 _RATE_LIMIT_MARKERS = ("rate limit", "throttl", "too many requests")
 
@@ -41,7 +38,6 @@ class KrakenAPIError(KrakenError):
     """Kraken returned an API-level error."""
 
     def __init__(self, messages: list[str]):
-        # Do not include request headers, payloads, or credentials in exceptions.
         super().__init__("Kraken API error: " + "; ".join(messages))
         self.messages = tuple(messages)
 
@@ -51,12 +47,7 @@ class KrakenAPIError(KrakenError):
 
 
 class KrakenClient:
-    """Small REST client limited to read-only Kraken endpoints.
-
-    Credentials are read from KRAKEN_API_KEY and KRAKEN_API_SECRET only when
-    a private query is requested. The injected transport and sleeper support
-    deterministic tests; production defaults use urllib and time.sleep.
-    """
+    """REST client limited to public data and authenticated read-only queries."""
 
     def __init__(
         self,
@@ -149,26 +140,31 @@ class KrakenClient:
         if endpoint not in _PRIVATE_ENDPOINTS:
             raise ValueError("Unsupported private Kraken endpoint; only read-only queries are allowed")
         key, secret = self._credentials()
-        nonce = self._next_nonce()
-        form = {str(k): str(v) for k, v in (params or {}).items()}
-        form["nonce"] = nonce
-        body = urllib.parse.urlencode(form).encode("ascii")
         path = f"/0/private/{endpoint}"
-        signature = self._signature(path, body, nonce, secret)
-        request = urllib.request.Request(
-            self._base_url + path,
-            data=body,
-            headers={
-                "API-Key": key,
-                "API-Sign": signature,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": "Bob-2-readonly/1",
-            },
-            method="POST",
-        )
-        # Never log the request, headers, body, key, signature, or response data.
-        _LOG.debug("Kraken private read-only query: %s", endpoint)
-        return self._with_retries(lambda: self._decode_response(self._send(request)))
+
+        def send_fresh_authenticated_request() -> dict:
+            # Build the signed request inside the retry operation: each attempt,
+            # including a rate-limit retry, receives a newly allocated nonce.
+            nonce = self._next_nonce()
+            form = {str(k): str(v) for k, v in (params or {}).items()}
+            form["nonce"] = nonce
+            body = urllib.parse.urlencode(form).encode("ascii")
+            request = urllib.request.Request(
+                self._base_url + path,
+                data=body,
+                headers={
+                    "API-Key": key,
+                    "API-Sign": self._signature(path, body, nonce, secret),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Bob-2-readonly/1",
+                },
+                method="POST",
+            )
+            # Never log request headers, body, credentials, or response data.
+            _LOG.debug("Kraken private read-only query: %s", endpoint)
+            return self._decode_response(self._send(request))
+
+        return self._with_retries(send_fresh_authenticated_request)
 
     def _with_retries(self, operation: Callable[[], dict]) -> dict:
         for attempt in range(self.retries + 1):
@@ -181,12 +177,11 @@ class KrakenClient:
                 _LOG.warning("Kraken rate limited request; retrying after %.1f seconds", delay)
                 self._sleep(delay)
             except KrakenTransportError:
-                # Transport failures are reported immediately; do not blindly
-                # repeat a private request whose server-side outcome is unknown.
+                # Avoid repeating ambiguous requests when the server may have
+                # accepted them but the response was lost.
                 raise
         raise KrakenTransportError("Kraken request retry limit exceeded")
 
-    # Public market-data methods
     def ticker(self, pair: str) -> dict:
         return self._get_json("Ticker", {"pair": pair})
 
@@ -205,11 +200,8 @@ class KrakenClient:
         return self._get_json("Depth", {"pair": pair, "count": count})
 
     def public_health(self) -> dict:
-        """Return Kraken system status and adapter health; does not authenticate."""
-        result = self._get_json("SystemStatus")
-        return {"ok": True, "system_status": result}
+        return {"ok": True, "system_status": self._get_json("SystemStatus")}
 
-    # Authenticated query-only private methods
     def balances(self) -> dict:
         return self._post_private("Balance")
 
@@ -222,6 +214,5 @@ class KrakenClient:
         return self._post_private("TradesHistory", {"ofs": ofs, "trades": "true" if trades else "false"})
 
     def private_health(self) -> dict:
-        """Check credentials and authenticated query access by retrieving balances."""
         balances = self.balances()
         return {"ok": True, "private_query": "available", "balance_assets": len(balances)}
