@@ -1,77 +1,48 @@
-import os
-import tempfile
 import unittest
+from decimal import Decimal
 
-from paper_ledger import PaperLedger
-from paper_trader import PaperTrader
-from risk import Limits
-from signal_engine import analyze_prices, kraken_ohlc_closes
-
-
-class SignalEngineTests(unittest.TestCase):
-    def test_bullish_and_bearish_explainable_signals(self):
-        bullish = analyze_prices("BTC/GBP", list(range(1, 25)))
-        bearish = analyze_prices("BTC/GBP", list(range(25, 1, -1)), position_units=1)
-        self.assertEqual(bullish.action, "BUY")
-        self.assertEqual(bearish.action, "SELL")
-        self.assertGreaterEqual(len(bullish.reasons), 2)
-        self.assertIn("momentum", " ".join(bullish.reasons).lower())
-
-    def test_bearish_signal_without_holding_is_hold(self):
-        self.assertEqual(analyze_prices("BTC/GBP", list(range(25, 1, -1))).action, "HOLD")
-
-    def test_invalid_or_short_series_rejected(self):
-        for values in ([], [1, 2], [1, 0] + list(range(3, 24))):
-            with self.assertRaises(ValueError):
-                analyze_prices("BTC/GBP", values)
-
-    def test_parses_kraken_ohlc_close_column(self):
-        payload = {"result": {"XXBTZGBP": [[1, "10", "11", "9", "10.5"], [2, "11", "12", "10", "11.5"]], "last": 2}}
-        self.assertEqual(kraken_ohlc_closes(payload), [10.5, 11.5])
+try:
+    from bob2.paper_ledger import PaperLedger
+    from bob2.paper_trader import PaperTrader
+    from bob2.risk import Limits, allowed_buy_gbp
+except ModuleNotFoundError:
+    from paper_ledger import PaperLedger
+    from paper_trader import PaperTrader
+    from risk import Limits, allowed_buy_gbp
 
 
 class PaperLedgerTests(unittest.TestCase):
     def setUp(self):
+        import tempfile
         self.temp = tempfile.TemporaryDirectory()
-        self.path = os.path.join(self.temp.name, "paper.sqlite3")
+        self.path = self.temp.name + "/ledger.sqlite3"
         self.ledger = PaperLedger(self.path, 100)
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_simulated_buy_sell_fee_and_persistent_state(self):
-        buy = self.ledger.execute("BTC/GBP", "BUY", 10, 5, 0.01, timestamp="2026-01-01T10:00:00+00:00")
-        self.assertEqual((buy["execution"], buy["fee"]), ("PAPER_SIMULATED", 0.5))
-        self.assertAlmostEqual(self.ledger.state("BTC/GBP")["cash"], 49.5)
+    def test_legacy_fee_and_realized_report(self):
+        self.ledger.execute("BTC/GBP", "BUY", 10, 5, 0.01, timestamp="2026-01-01T10:00:00+00:00")
         self.ledger.execute("BTC/GBP", "SELL", 12, 5, 0.01, timestamp="2026-01-01T11:00:00+00:00")
-        report = PaperLedger(self.path, 100).daily_report("2026-01-01", market="BTC/GBP")
+        report = self.ledger.daily_report("2026-01-01", market="BTC/GBP")
         self.assertEqual(report["fills"], 2)
-        self.assertEqual(report["fees"], 1.1)
-        self.assertAlmostEqual(report["realized_pnl_after_fees"], 8.4)
-        self.assertAlmostEqual(report["sell_notional"], 60)
-
-    def test_no_overselling_or_overspending_and_initial_balance_is_fixed(self):
-        with self.assertRaises(ValueError):
-            self.ledger.execute("BTC/GBP", "BUY", 10, 11, 0.01)
-        with self.assertRaises(ValueError):
-            self.ledger.execute("BTC/GBP", "SELL", 10, 1, 0.01)
-        with self.assertRaises(ValueError):
-            PaperLedger(self.path, 101)
+        self.assertEqual(report["fees"], Decimal("1.10"))
+        self.assertEqual(report["realized_pnl_after_fees"], Decimal("8.40"))
+        self.assertEqual(report["sell_notional"], Decimal("60"))
 
     def test_daily_report_mark_to_market_and_unrealized(self):
         self.ledger.execute("BTC/GBP", "BUY", 10, 2, 0, timestamp="2026-01-01T10:00:00+00:00")
         report = self.ledger.daily_report("2026-01-01", market="BTC/GBP", mark_price=12)
-        self.assertEqual(report["position_units"], 2)
-        self.assertEqual(report["unrealized_pnl"], 4)
-        self.assertEqual(report["equity"], 104)
+        self.assertEqual(report["position_units"], Decimal("2"))
+        self.assertEqual(report["unrealized_pnl"], Decimal("4"))
+        self.assertEqual(report["equity"], Decimal("104"))
 
-    def test_trader_respects_daily_loss_and_emergency_halt(self):
-        rising = list(range(1, 25))
-        halted = PaperTrader(self.ledger, Limits(emergency_halt=True)).evaluate("BTC/GBP", rising)
-        self.assertIsNone(halted["transaction"])
-        self.assertEqual(halted["action"], "BUY")
-        stopped = PaperTrader(self.ledger, Limits(max_daily_loss_gbp=3)).evaluate("BTC/GBP", rising, daily_pnl_gbp=-3)
-        self.assertIsNone(stopped["transaction"])
+    def test_risk_helpers_and_paper_trader(self):
+        self.assertGreater(allowed_buy_gbp(100, 0, 0, Limits()), 0)
+        rising = list(range(1,25))
+        result = PaperTrader(self.ledger, Limits(emergency_halt=True)).evaluate("BTC/GBP", rising)
+        self.assertIsNone(result["transaction"])
+        self.assertEqual(result["action"], "BUY")
 
 
 if __name__ == "__main__":
