@@ -17,7 +17,7 @@ PAIRS = {
 }
 
 
-def confirmation(pairs=("XXBTZGBP", "XBTGBP", "XBT/GBP", "XETHZEUR", "ETHEUR", "ETH/EUR"), at=NOW):
+def confirmation(pairs=("XXBTZGBP", "XETHZEUR"), at=NOW):
     return EligibilityConfirmation(frozenset(pairs), at, timedelta(hours=1), "reviewer-123",
                                    "Kraken account product-eligibility review CR-4821", "account-alias-uk-retail-01")
 
@@ -35,25 +35,38 @@ class AssetAliasTests(unittest.TestCase):
                 aliases.normalize(unknown)
 
     def test_alias_collision_is_rejected_as_ambiguous(self):
-        collision = {**ASSETS, "XBT": {"altname": "OTHER", "wsname": "OTHER"}}
-        aliases = AssetAliases(collision)
+        aliases = AssetAliases({**ASSETS, "XBT": {"altname": "OTHER", "wsname": "OTHER"}})
         with self.assertRaisesRegex(ValueError, "Ambiguous"):
             aliases.normalize("XBT")
+        colliding_pairs = {"COLLIDE": {**PAIRS["XXBTZGBP"], "base": "XBT"}}
+        result = discover_markets({**ASSETS, "XBT": {"altname": "OTHER", "wsname": "OTHER"}},
+                                  colliding_pairs, eligibility=confirmation(pairs=("COLLIDE",)), now=NOW)[0]
+        self.assertFalse(result.eligible_for_uk_account)
 
     def test_malformed_asset_rows_do_not_create_valid_aliases(self):
-        malformed = {"BROKEN": None, "EMPTY": {"altname": ""}, "XXBT": ASSETS["XXBT"]}
-        aliases = AssetAliases(malformed)
-        with self.assertRaises(ValueError):
-            aliases.normalize("BROKEN")
-        with self.assertRaises(ValueError):
-            aliases.normalize("EMPTY")
+        aliases = AssetAliases({"BROKEN": None, "EMPTY": {"altname": ""}, "XXBT": ASSETS["XXBT"]})
+        for malformed in ("BROKEN", "EMPTY"):
+            with self.assertRaises(ValueError):
+                aliases.normalize(malformed)
         self.assertEqual(aliases.normalize("XXBT"), "XBT")
 
 
 class MarketDiscoveryTests(unittest.TestCase):
-    def test_dynamic_discovery_normalizes_symbols_and_decimal_market_rules(self):
-        found = discover_markets(ASSETS, PAIRS, eligibility=confirmation(), now=NOW)
-        btc = {m.pair_id: m for m in found}["XXBTZGBP"]
+    def test_exact_pair_id_is_required_for_account_eligibility(self):
+        confirmed = confirmation(pairs=("XXBTZGBP",))
+        found = {m.pair_id: m for m in discover_markets(ASSETS, PAIRS, eligibility=confirmed, now=NOW)}
+        self.assertTrue(found["XXBTZGBP"].eligible_for_uk_account)
+        self.assertFalse(found["XETHZEUR"].eligible_for_uk_account)
+        # Approval for an altname, wsname, or shared base/quote symbol cannot authorize another ID.
+        for alias in ("XBTGBP", "XBT/GBP", "XBT/GBP"):
+            alias_confirmation = confirmation(pairs=(alias,))
+            markets = {m.pair_id: m for m in discover_markets(ASSETS, PAIRS, eligibility=alias_confirmation, now=NOW)}
+            self.assertFalse(markets["XXBTZGBP"].eligible_for_uk_account)
+            self.assertTrue(any("exact Kraken pair ID" in r for r in markets["XXBTZGBP"].exclusion_reasons))
+
+    def test_dynamic_discovery_market_rules_are_decimal(self):
+        found = {m.pair_id: m for m in discover_markets(ASSETS, PAIRS, eligibility=confirmation(), now=NOW)}
+        btc = found["XXBTZGBP"]
         self.assertEqual((btc.base, btc.quote), ("XBT", "GBP"))
         self.assertEqual(btc.order_minimum, Decimal("0.0001"))
         self.assertEqual(btc.cost_minimum, Decimal("0.50"))
@@ -61,42 +74,40 @@ class MarketDiscoveryTests(unittest.TestCase):
         self.assertEqual(btc.quantity_increment, Decimal("1E-8"))
         self.assertTrue(btc.eligible_for_uk_account)
 
-    def test_missing_null_empty_and_unknown_pair_assets_are_excluded(self):
-        pairs = {
-            "NONE": {**PAIRS["XXBTZGBP"], "base": None},
-            "EMPTY": {**PAIRS["XXBTZGBP"], "base": ""},
-            "UNKNOWN": {**PAIRS["XXBTZGBP"], "quote": "NOPE"},
-            "GOOD": PAIRS["XXBTZGBP"],
-        }
-        found = {m.pair_id: m for m in discover_markets(ASSETS, pairs, eligibility=confirmation(), now=NOW)}
+    def test_missing_null_empty_and_unknown_assets_fail_closed(self):
+        pairs = {"NONE": {**PAIRS["XXBTZGBP"], "base": None},
+                 "EMPTY": {**PAIRS["XXBTZGBP"], "base": ""},
+                 "UNKNOWN": {**PAIRS["XXBTZGBP"], "quote": "NOPE"},
+                 "GOOD": PAIRS["XXBTZGBP"]}
+        eligible_ids = ("NONE", "EMPTY", "UNKNOWN", "GOOD")
+        found = {m.pair_id: m for m in discover_markets(ASSETS, pairs, eligibility=confirmation(eligible_ids), now=NOW)}
         for pair in ("NONE", "EMPTY", "UNKNOWN"):
             self.assertFalse(found[pair].eligible_for_uk_account)
             self.assertTrue(any("invalid" in reason for reason in found[pair].exclusion_reasons))
         self.assertTrue(found["GOOD"].eligible_for_uk_account)
 
     def test_expired_or_nonmatching_account_policy_fails_closed(self):
-        for approved in (None, confirmation(at=NOW - timedelta(hours=2)), confirmation(pairs=(), at=NOW)):
+        for approved in (None, confirmation(at=NOW - timedelta(hours=2)), confirmation(pairs=())):
             markets = discover_markets(ASSETS, PAIRS, eligibility=approved, now=NOW)
             self.assertFalse(any(m.eligible_for_uk_account for m in markets))
 
-    def test_suspended_derivative_margin_and_missing_rules_excluded_with_reasons(self):
+    def test_restrictions_and_missing_trading_rules_are_excluded(self):
         altered = dict(PAIRS)
-        altered["MARGIN"] = {**PAIRS["XXBTZGBP"], "altname": "XBTGBP-M", "margin_only": True}
+        altered["MARGIN"] = {**PAIRS["XXBTZGBP"], "margin_only": True}
         altered["NORULES"] = {"base": "XXBT", "quote": "ZGBP", "status": "online"}
-        markets = discover_markets(ASSETS, altered, eligibility=confirmation(pairs=("XXBTZGBP", "XBTGBP", "XBT/GBP", "MARGIN", "XBTGBP-M", "NORULES", "XBT/GBP")), now=NOW)
-        by_id = {m.pair_id: m for m in markets}
+        confirmed_ids = ("XXBTZGBP", "XETHZEUR", "MARGIN", "NORULES")
+        by_id = {m.pair_id: m for m in discover_markets(ASSETS, altered, eligibility=confirmation(confirmed_ids), now=NOW)}
         self.assertFalse(by_id["SUSP"].eligible_for_uk_account)
-        self.assertTrue(any("status" in r for r in by_id["SUSP"].exclusion_reasons))
         self.assertFalse(by_id["XBTUSD.F"].eligible_for_uk_account)
-        self.assertTrue(by_id["MARGIN"].exclusion_reasons)
+        self.assertFalse(by_id["MARGIN"].eligible_for_uk_account)
         self.assertFalse(by_id["BADMIN"].eligible_for_uk_account)
-        self.assertTrue(by_id["NORULES"].exclusion_reasons)
+        self.assertFalse(by_id["NORULES"].eligible_for_uk_account)
 
     def test_invalid_confirmation_and_response_shapes_rejected(self):
         with self.assertRaises(ValueError):
-            EligibilityConfirmation(frozenset({"XBTGBP"}), NOW.replace(tzinfo=None), timedelta(hours=1), "reviewer", "source", "account")
+            EligibilityConfirmation(frozenset({"XBTGBP"}), NOW.replace(tzinfo=None), timedelta(hours=1), "r", "s", "a")
         with self.assertRaises(ValueError):
-            EligibilityConfirmation(frozenset({None}), NOW, timedelta(hours=1), "reviewer", "source", "account")
+            EligibilityConfirmation(frozenset({None}), NOW, timedelta(hours=1), "r", "s", "a")
         with self.assertRaises(ValueError):
             discover_markets([], PAIRS, eligibility=confirmation(), now=NOW)
 
@@ -119,7 +130,7 @@ class MarketUniverseTests(unittest.TestCase):
         self.assertEqual(universe.eligible_markets(), ())
 
     def test_failed_refresh_clears_previous_eligible_markets(self):
-        client, universe = FakeClient(), None
+        client = FakeClient()
         universe = MarketUniverse(client, eligibility=confirmation(), clock=lambda: NOW)
         universe.refresh()
         self.assertTrue(universe.eligible_markets())

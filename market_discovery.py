@@ -1,9 +1,8 @@
 """Read-only Kraken spot discovery with explicitly scoped eligibility metadata.
 
 This module cannot authenticate or establish Kraken-account permissions. The
-eligibility record must be supplied by an authorized reviewer from a current,
-authoritative account-specific source; it is an application policy input, not
-proof that Kraken permits trading.
+eligibility record is caller-provided policy input, not proof Kraken permits
+trading. Only exact Kraken AssetPairs result keys authorize a pair.
 """
 from __future__ import annotations
 
@@ -48,30 +47,24 @@ class AssetAliases:
     def __init__(self, assets_payload: Mapping[str, Any]):
         rows = _result(assets_payload, "Assets")
         aliases: dict[str, set[str]] = {}
-        self.invalid_ids: set[str] = set()
         for raw_id, raw in rows.items():
             if raw_id == "last":
                 continue
             asset_id = raw_id.strip().upper() if isinstance(raw_id, str) else ""
             if not asset_id or not isinstance(raw, Mapping):
-                if asset_id:
-                    self.invalid_ids.add(asset_id)
                 continue
             altname = raw.get("altname")
             if altname is not None and (not isinstance(altname, str) or not altname.strip()):
-                self.invalid_ids.add(asset_id)
                 continue
             canonical = (altname.strip() if isinstance(altname, str) and altname.strip() else asset_id).upper()
             names = {asset_id, canonical}
             wsname = raw.get("wsname")
             if wsname is not None:
                 if not isinstance(wsname, str) or not wsname.strip():
-                    self.invalid_ids.add(asset_id)
                     continue
                 names.add(wsname.strip().upper())
             for name in names:
                 aliases.setdefault(name, set()).add(canonical)
-            # Register stripped form only as an alias of a known prefixed ID.
             if len(asset_id) > 1 and asset_id[0] in {"X", "Z"}:
                 aliases.setdefault(asset_id[1:], set()).add(canonical)
         self._aliases = aliases
@@ -85,19 +78,16 @@ class AssetAliases:
             raise ValueError(f"Unknown asset identifier: {normalized}")
         if len(candidates) != 1:
             raise ValueError(f"Ambiguous asset alias: {normalized}")
-        canonical = next(iter(candidates))
-        if canonical in self.invalid_ids:
-            raise ValueError(f"Malformed asset metadata for {normalized}")
-        return canonical
+        return next(iter(candidates))
 
 
 @dataclass(frozen=True)
 class EligibilityConfirmation:
     """Reviewer-supplied policy assertion; this class does not verify Kraken rights.
 
-    ``authoritative_source`` should identify a current Kraken account-specific
-    eligibility source or compliance determination. ``account_scope`` should
-    uniquely identify the relevant account without storing API credentials.
+    ``pair_ids`` must contain exact keys from Kraken's AssetPairs response.
+    Authoritative source and account scope are recorded as review metadata only;
+    they are not independently validated by this code.
     """
     pair_ids: frozenset[str]
     confirmed_at: datetime
@@ -108,7 +98,7 @@ class EligibilityConfirmation:
 
     def __post_init__(self):
         if not isinstance(self.pair_ids, (set, frozenset)):
-            raise ValueError("Eligibility pair_ids must be a set")
+            raise ValueError("Eligibility pair_ids must be a set of exact Kraken pair IDs")
         normalized = set()
         for item in self.pair_ids:
             if not isinstance(item, str) or not item.strip():
@@ -127,8 +117,8 @@ class EligibilityConfirmation:
         age = _aware_utc(now, "now") - self.confirmed_at
         return timedelta(0) <= age <= self.valid_for
 
-    def confirms(self, *identifiers: str) -> bool:
-        return any(identifier in self.pair_ids for identifier in identifiers)
+    def confirms_pair_id(self, pair_id: str) -> bool:
+        return pair_id in self.pair_ids
 
 
 @dataclass(frozen=True)
@@ -150,7 +140,7 @@ class SpotMarket:
 def discover_markets(assets_payload: Mapping[str, Any], pairs_payload: Mapping[str, Any], *,
                      eligibility: EligibilityConfirmation | None,
                      now: datetime | None = None) -> tuple[SpotMarket, ...]:
-    """Parse available pair metadata; missing/unverified items fail closed."""
+    """Parse pair metadata; only an exact pair-ID confirmation can authorize."""
     current = _aware_utc(now or datetime.now(timezone.utc), "now")
     aliases = AssetAliases(assets_payload)
     pairs = _result(pairs_payload, "AssetPairs")
@@ -212,11 +202,10 @@ def discover_markets(assets_payload: Mapping[str, Any], pairs_payload: Mapping[s
             price_increment = quantity_increment = Decimal(0)
             reasons.append("missing or invalid price/quantity increment metadata")
 
-        identifiers = (pair_id, altname, wsname, f"{base}/{quote}")
         if not confirmation_current:
             reasons.append("current UK account-specific eligibility confirmation is missing or expired")
-        elif not eligibility.confirms(*identifiers):
-            reasons.append("pair is not explicitly confirmed eligible for this UK account")
+        elif not eligibility.confirms_pair_id(pair_id):
+            reasons.append("exact Kraken pair ID is not explicitly confirmed for this UK account")
         markets.append(SpotMarket(pair_id, altname, wsname, base, quote, status,
                                   order_minimum, cost_minimum, price_increment, quantity_increment,
                                   not reasons, tuple(reasons)))
