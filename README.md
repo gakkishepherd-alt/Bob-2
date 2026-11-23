@@ -1,50 +1,26 @@
-# Bob-2 — Kraken trading research manager
+# Bob-2 — Kraken read-only trading research manager
 
-Paper-first trading experiment. Kraken integration in this branch is read-only and no live orders are implemented.
+Bob-2 is a paper-first research project. Kraken API support is **read-only**; no exchange order placement or live trading is implemented. The signal engine and ledger described below operate locally and simulate fills only.
 
-## Capital allocation and safety
+## Explainable signal engine
 
-- Allocation policy can use up to 100% of actual unreserved cash; realised profits may be reinvested when reflected in the account cash balance.
-- Available funds are account cash less cash reserved for open orders or other commitments. The configurable estimated fee is reserved before calculating affordable buy notional, and configurable minimum order sizes are enforced.
-- Allocation fraction, estimated fee rate, minimum order size and daily-loss limit are configurable through `risk.Limits`.
-- The existing daily-loss safeguard remains active. An independent emergency trading halt is also available through `Limits(emergency_halt=True)`.
-- The system has no deposit, withdrawal, transfer, borrowing, margin, leverage, futures, derivatives or order-placement methods. Kraken private endpoints are allowlisted to balance/open-order/trade-history queries only.
-- Live execution is disabled. Read-only credentials cannot place orders; do not enable trading permission on the Kraken API key.
+`signal_engine.py` evaluates chronological closing prices using a fast/slow simple-moving-average comparison plus recent percentage momentum. A BUY requires both an uptrend and sufficiently positive momentum; a SELL requires both bearish conditions and an existing paper position. Otherwise it recommends HOLD. The result includes the indicator values and human-readable reasons. Defaults are a 5-close fast SMA, 20-close slow SMA, 3-interval momentum, and 0.25% threshold. These are transparent research heuristics, not investment advice or a guarantee of performance. `kraken_ohlc_closes` parses OHLC payloads already supplied to it; it does not fetch data.
 
-## Read-only Kraken setup
+## Paper trading, fees and reports
 
-The adapter uses the Kraken REST API over HTTPS. Public ticker, OHLC, asset-pair, order-book, and system-status calls do not require credentials. Authenticated calls are limited in code to `Balance`, `OpenOrders`, and `TradesHistory`.
+`PaperTrader` applies the existing cash-allocation, fee, daily-loss and emergency-halt controls before simulating a BUY. SELL signals close the held paper position; no leverage, shorting, or borrowing is supported. `PaperLedger` persists initial cash and append-only simulated fills in SQLite, calculating cash, holdings, average-cost basis, estimated fees (rounded up to a penny), realized P&L after fees, and optional mark-to-market unrealized P&L/equity. Daily reports aggregate fills, notionals, fees and realized P&L for a UTC date. Mark-to-market fields are included when a market and current mark price are provided; no historical price feed is implied.
 
-1. Create a Kraken API key with **query/read permissions only**: query funds, open orders, and closed orders/trades as needed. Do not enable trade, deposit, withdrawal, transfer, or other write permissions. Enable IP restrictions where available.
-2. Provide the key and Kraken's base64-encoded private key through the process environment or your deployment secrets manager. Never paste credentials into chat, source files, command-line arguments, logs, or commit history.
-
-   ```sh
-   export KRAKEN_API_KEY='provided-by-your-secret-store'
-   export KRAKEN_API_SECRET='provided-by-your-secret-store'
-   ```
-
-3. Use a least-privilege environment and rotate/revoke credentials if exposed. Keep `.env` files out of version control; the client reads environment variables only when a private query is invoked.
-
-## Tests and CI
-
-Run locally with:
+Ledger files are local state and should not be committed. The default CLI ledger is `~/.bob2/paper_ledger.sqlite3`; its initial balance is fixed at creation and later CLI invocations must use the same `--cash` value.
 
 ```bash
 python -m unittest discover -v
+python -m bob2.paper_cli --market BTC/GBP --prices 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24 --cash 100 --daily-report
 ```
 
-GitHub Actions runs this command on pushes and pull requests using Python 3.11, 3.12 and 3.13. The adapter tests use mocked responses and make no Kraken network calls.
+Prices passed on the command line are samples. Market data collection is separate; Kraken methods in `kraken.py` remain constrained to public market data and allowlisted private read-only queries. Do not grant trade permissions to a Kraken API key.
 
-The private retry path constructs and signs a new request on every attempt with a fresh strictly increasing nonce. Rate-limited responses are retried with bounded backoff; authentication failures are surfaced without retry. Ambiguous network failures are not retried.
+## Existing safeguards and Kraken adapter
 
-## Existing paper CLI
+Allocation fraction, estimated fee rate, minimum order size, daily-loss limit, and emergency halt are configurable through `risk.Limits`. Kraken credentials are read from environment variables only for private balance/open-order/trade-history queries. No order, deposit, withdrawal, transfer, borrowing, margin, leverage, futures, or derivatives operation is implemented.
 
-Prices and balances supplied to the CLI are examples; they are not live Kraken values and no orders are placed.
-
-```bash
-python -m bob2.cli --market BTC/GBP --price 50000 --cash 100 --position 0
-```
-
-## Outstanding limitations
-
-This adapter does not provide websocket feeds, persistence, balance-to-portfolio reconciliation, GBP market eligibility checks, paper order simulation, backtesting, or automated agent coordination. Kraken API permissions must be configured and independently audited; code-level endpoint restrictions do not replace venue-side read-only key permissions. Do not use any output as trade authorization. Live execution remains absent and disabled.
+Run the full test suite with `python -m unittest discover -v`. Kraken adapter tests use mocked responses and make no network calls.
