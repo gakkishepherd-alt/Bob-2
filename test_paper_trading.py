@@ -22,13 +22,17 @@ class PaperLedgerTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_legacy_fee_and_realized_report(self):
-        self.ledger.execute("BTC/GBP", "BUY", 10, 5, 0.01, timestamp="2026-01-01T10:00:00+00:00")
-        self.ledger.execute("BTC/GBP", "SELL", 12, 5, 0.01, timestamp="2026-01-01T11:00:00+00:00")
+        buy = self.ledger.execute("BTC/GBP", "BUY", 10, 5, 0.01, timestamp="2026-01-01T10:00:00+00:00")
+        sell = self.ledger.execute("BTC/GBP", "SELL", 12, 5, 0.01, timestamp="2026-01-01T11:00:00+00:00")
         report = self.ledger.daily_report("2026-01-01", market="BTC/GBP")
+        self.assertEqual((buy["fee"], sell["fee"]), (Decimal("0.50"), Decimal("0.60")))
         self.assertEqual(report["fills"], 2)
         self.assertEqual(report["fees"], Decimal("1.10"))
-        self.assertEqual(report["realized_pnl_after_fees"], Decimal("8.40"))
+        # P&L is gross price gain 10 less both fees, each exactly once.
+        self.assertEqual(report["realized_pnl_after_fees"], Decimal("8.90"))
         self.assertEqual(report["sell_notional"], Decimal("60"))
+        self.assertEqual(self.ledger.balances()["GBP"], Decimal("108.90"))
+        self.assertEqual(self.ledger.state("BTC/GBP")["units"], Decimal("0"))
 
     def test_daily_report_mark_to_market_and_unrealized(self):
         self.ledger.execute("BTC/GBP", "BUY", 10, 2, 0, timestamp="2026-01-01T10:00:00+00:00")
