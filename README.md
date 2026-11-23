@@ -1,26 +1,7 @@
-# Bob-2 — Kraken read-only trading research manager
+## Currency-aware paper ledger
 
-Bob-2 is a paper-first research project. Kraken API support is **read-only**; no exchange order placement or live trading is implemented. The signal engine and ledger described below operate locally and simulate fills only.
+The ledger persists financial amounts as decimal text and performs accounting with Python `Decimal`; it does not store money in SQLite floating-point columns. Use `initial_balances` to seed separate currencies. A trade is `BASE/QUOTE`: buys debit quote and credit base, sells debit base and credit quote, and every fee has its own currency. Repeated fills for one order can be recorded with the same `fill_id` to represent partial fills. Backdated fills are rejected; equal timestamps replay in append sequence.
 
-## Explainable signal engine
+Daily reports replay ledger events through the end of the requested UTC day. Pass `market_prices` (quote currency per base unit) and `fx_rates` (each currency into the requested reporting currency) for verified market-valued equity. If any held asset or balance is unpriced, `verified_equity` is `None`; available cost basis may be reported as `provisional_equity`, never represented as a verified mark. FX and market marks are supplied inputs, not an automatic conversion feed.
 
-`signal_engine.py` evaluates chronological closing prices using a fast/slow simple-moving-average comparison plus recent percentage momentum. A BUY requires both an uptrend and sufficiently positive momentum; a SELL requires both bearish conditions and an existing paper position. Otherwise it recommends HOLD. The result includes the indicator values and human-readable reasons. Defaults are a 5-close fast SMA, 20-close slow SMA, 3-interval momentum, and 0.25% threshold. These are transparent research heuristics, not investment advice or a guarantee of performance. `kraken_ohlc_closes` parses OHLC payloads already supplied to it; it does not fetch data.
-
-## Paper trading, fees and reports
-
-`PaperTrader` applies the existing cash-allocation, fee, daily-loss and emergency-halt controls before simulating a BUY. SELL signals close the held paper position; no leverage, shorting, or borrowing is supported. `PaperLedger` persists initial cash and append-only simulated fills in SQLite, calculating cash, holdings, average-cost basis, estimated fees (rounded up to a penny), realized P&L after fees, and optional mark-to-market unrealized P&L/equity. Daily reports aggregate fills, notionals, fees and realized P&L for a UTC date. Mark-to-market fields are included when a market and current mark price are provided; no historical price feed is implied.
-
-Ledger files are local state and should not be committed. The default CLI ledger is `~/.bob2/paper_ledger.sqlite3`; its initial balance is fixed at creation and later CLI invocations must use the same `--cash` value.
-
-```bash
-python -m unittest discover -v
-python -m bob2.paper_cli --market BTC/GBP --prices 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24 --cash 100 --daily-report
-```
-
-Prices passed on the command line are samples. Market data collection is separate; Kraken methods in `kraken.py` remain constrained to public market data and allowlisted private read-only queries. Do not grant trade permissions to a Kraken API key.
-
-## Existing safeguards and Kraken adapter
-
-Allocation fraction, estimated fee rate, minimum order size, daily-loss limit, and emergency halt are configurable through `risk.Limits`. Kraken credentials are read from environment variables only for private balance/open-order/trade-history queries. No order, deposit, withdrawal, transfer, borrowing, margin, leverage, futures, or derivatives operation is implemented.
-
-Run the full test suite with `python -m unittest discover -v`. Kraken adapter tests use mocked responses and make no network calls.
+Legacy ledger migration is automatic on open. The old schema used SQLite REAL values, so migration imports their decimal string representations (the precision the legacy file retained); it preserves old tables for audit and explicitly assumes historical legacy fees were charged in the market's quote currency because v1 recorded no fee currency. New events use decimal-text fields. This remains paper-only; Kraken has no order-placement endpoint.
